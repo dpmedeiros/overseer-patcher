@@ -35,8 +35,12 @@ forwarded to Wine's built-in DirectDraw, and corrected all 452 targeted pixels
 in texture 27 when copying a synthetic source surface. Its source is
 `wrapper/smoke.c`; run `./wrapper/build.sh --smoke` to build it. A full visual
 test in Overseer is still needed before this replaces the map edit in the
-patcher. The real Steam installation currently has the existing map palette
-patch, so this wrapper would deliberately make no texture changes there.
+patcher. A live test temporarily installed the original map and wrapper in
+the Steam game, but Overseer did not open a game window. Direct Proton loaded
+the DLL and started `OVERSEER.EXE`, yet did not reach `DirectDrawCreate` during
+the test. The Steam launch also stalled before a game window appeared. The
+patched map, DLL state, and Steam launch option were restored afterward. The
+startup behavior remains unexplained.
 
 For a visual test without touching the installed game, create a copy-on-write
 test tree on the same Btrfs filesystem:
@@ -50,5 +54,5 @@ The helper prints a `.wrapper-test-*` directory in the repository. Launch its
 `OVERSEER.EXE` with the
 tested Proton tool and `WINEDLLOVERRIDES=ddraw=n,b`. A direct Proton launch
 from this test tree loaded the native proxy but did not reach
-`DirectDrawCreate` within 30 seconds. A normal Steam launch or a longer
-interactive run is still needed for the visual office check.
+`DirectDrawCreate` within 30 seconds. The startup problem needs diagnosis
+before another visual office check.
