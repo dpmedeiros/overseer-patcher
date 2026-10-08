@@ -1,18 +1,14 @@
-/* Overseer-only DirectDraw proxy. Build as 32-bit ddraw.dll. It forwards
- * Overseer's DirectDraw entry points to Wine and corrects known office source
- * textures and mipmaps before IDirect3DTexture2::Load. */
-#include "texture_patch.h"
+/* Overseer DirectDraw proxy. It selects A1R5G5B5 textures and sets alpha
+ * from each source surface's color key before Direct3D copies the texture. */
+#include "alpha_patch.h"
 #include <d3d.h>
 #include <ddraw.h>
 #include <windows.h>
 
-#define MAP_BYTES 4887699u
-#define MAX_TEXTURES 4096u
+#define MAX_TEXTURES 32768u
 
 static HMODULE self_module;
 static HMODULE system_ddraw;
-static int map_kind;
-static int map_loaded;
 
 static HRESULT(WINAPI *real_create)(GUID *, IDirectDraw **, IUnknown *);
 static HRESULT(WINAPI *real_enumerate_a)(LPDDENUMCALLBACKA, void *);
@@ -25,6 +21,12 @@ static HRESULT(WINAPI *real_dd2_surface)(IDirectDraw2 *, DDSURFACEDESC *,
 static HRESULT(WINAPI *real_surface_qi)(IDirectDrawSurface *, REFIID, void **);
 static HRESULT(WINAPI *real_texture_load)(IDirect3DTexture2 *,
                                           IDirect3DTexture2 *);
+static ULONG(WINAPI *real_texture_release)(IDirect3DTexture2 *);
+static HRESULT(WINAPI *real_d3d2_create_device)(IDirect3D2 *, REFCLSID,
+                                                IDirectDrawSurface *,
+                                                IDirect3DDevice2 **);
+static HRESULT(WINAPI *real_device2_enum_formats)(
+    IDirect3DDevice2 *, LPD3DENUMTEXTUREFORMATSCALLBACK, void *);
 
 struct texture_surface {
   IDirect3DTexture2 *texture;
@@ -32,7 +34,6 @@ struct texture_surface {
 };
 static struct texture_surface textures[MAX_TEXTURES];
 static unsigned texture_count;
-static unsigned load_count;
 static const GUID texture2_iid = {
     0x93281502,
     0x8cf8,
@@ -42,6 +43,10 @@ static const GUID dd2_iid = {0xb3a6f3e0,
                              0x2b43,
                              0x11cf,
                              {0xa2, 0xde, 0x00, 0xaa, 0x00, 0xb9, 0x33, 0x56}};
+static const GUID d3d2_iid = {0x6aae1ec1,
+                              0x662a,
+                              0x11d0,
+                              {0x88, 0x9d, 0x00, 0xaa, 0x00, 0xbb, 0xb7, 0x6a}};
 
 static int same_guid(REFIID a, const GUID *b) {
   const uint8_t *pa = (const uint8_t *)a, *pb = (const uint8_t *)b;
@@ -50,21 +55,6 @@ static int same_guid(REFIID a, const GUID *b) {
     if (pa[i] != pb[i])
       return 0;
   return 1;
-}
-
-static void trace_number(const char *label, unsigned value) {
-  char buf[96];
-  const char hex[] = "0123456789abcdef";
-  unsigned i = 0, j;
-  while (label[i] && i < 70) {
-    buf[i] = label[i];
-    ++i;
-  }
-  for (j = 0; j < 8; ++j)
-    buf[i++] = hex[(value >> (28 - 4 * j)) & 15];
-  buf[i++] = '\n';
-  buf[i] = 0;
-  OutputDebugStringA(buf);
 }
 
 static int replace_slot(void **slot, void *replacement, void **original) {
@@ -81,62 +71,30 @@ static int replace_slot(void **slot, void *replacement, void **original) {
   return 1;
 }
 
-static void load_map(void) {
-  char path[MAX_PATH];
-  DWORD length, size, read_bytes;
-  HANDLE file;
-  uint8_t *map_data;
-  unsigned i;
-  if (map_loaded)
-    return;
-  map_loaded = 1;
-  length = GetModuleFileNameA(self_module, path, MAX_PATH);
-  if (!length || length >= MAX_PATH)
-    return;
-  while (length && path[length - 1] != '\\' && path[length - 1] != '/')
-    --length;
-  if (!length || length + sizeof("DATA\\R01\\R01.MAP") >= MAX_PATH)
-    return;
-  for (i = 0; i < sizeof("DATA\\R01\\R01.MAP"); ++i)
-    path[length + i] = "DATA\\R01\\R01.MAP"[i];
-  file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                     NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-  if (file == INVALID_HANDLE_VALUE)
-    return;
-  size = GetFileSize(file, NULL);
-  if (size == MAP_BYTES) {
-    map_data = HeapAlloc(GetProcessHeap(), 0, size);
-    if (map_data && ReadFile(file, map_data, size, &read_bytes, NULL) &&
-        read_bytes == size)
-      map_kind = overseer_map_kind(map_data, size);
-    if (map_data)
-      HeapFree(GetProcessHeap(), 0, map_data);
-  }
-  CloseHandle(file);
-  trace_number("Overseer map kind: ", (unsigned)map_kind);
-}
-
-static void patch_surface(IDirectDrawSurface *surface) {
+static void prepare_alpha_surface(IDirectDrawSurface *surface) {
   DDPIXELFORMAT format = {0};
   DDSURFACEDESC desc = {0};
-  unsigned changed;
-  if (!surface || map_kind != 1)
+  DDCOLORKEY key = {0};
+  int keyed;
+  if (!surface)
     return;
   format.dwSize = sizeof(format);
   if (FAILED(IDirectDrawSurface_GetPixelFormat(surface, &format)) ||
+      !(format.dwFlags & DDPF_ALPHAPIXELS) ||
+      format.dwRGBAlphaBitMask != 0x8000 ||
       format.dwRGBBitCount != 16 || format.dwRBitMask != 0x7c00 ||
       format.dwGBitMask != 0x03e0 || format.dwBBitMask != 0x001f)
     return;
+  keyed = SUCCEEDED(IDirectDrawSurface_GetColorKey(surface, DDCKEY_SRCBLT,
+                                                    &key));
   desc.dwSize = sizeof(desc);
   if (FAILED(IDirectDrawSurface_Lock(surface, NULL, &desc, DDLOCK_WAIT, NULL)))
     return;
-  if (desc.lPitch > 0 && desc.lpSurface) {
-    changed = overseer_patch_texture((uint8_t *)desc.lpSurface,
-                                     (size_t)desc.lPitch, desc.dwWidth,
-                                     desc.dwHeight, 0);
-    if (changed)
-      trace_number("Overseer pixels corrected: ", changed);
-  }
+  if (desc.lPitch > 0 && desc.lpSurface)
+    overseer_apply_alpha((uint8_t *)desc.lpSurface, (size_t)desc.lPitch,
+                         desc.dwWidth, desc.dwHeight, keyed,
+                         (uint16_t)key.dwColorSpaceLowValue,
+                         (uint16_t)key.dwColorSpaceHighValue);
   IDirectDrawSurface_Unlock(surface, desc.lpSurface);
 }
 
@@ -164,29 +122,18 @@ static IDirectDrawSurface *find_surface(IDirect3DTexture2 *texture) {
   return NULL;
 }
 
-static void patch_mips(IDirectDrawSurface *base) {
+static void prepare_mips(IDirectDrawSurface *base) {
   IDirectDrawSurface *current = base, *next;
   DDSCAPS caps = {DDSCAPS_MIPMAP};
-  DDSURFACEDESC desc = {0};
   unsigned level;
-  if (!base || map_kind != 1)
+  if (!base)
     return;
-  for (level = 1; level <= 10; ++level) {
+  for (level = 1; level <= 16; ++level) {
     next = NULL;
     if (FAILED(IDirectDrawSurface_GetAttachedSurface(current, &caps, &next)) ||
         !next || next == current)
       break;
-    desc.dwSize = sizeof(desc);
-    if (SUCCEEDED(IDirectDrawSurface_Lock(next, NULL, &desc, DDLOCK_WAIT, NULL))) {
-      unsigned changed = 0;
-      if (desc.lPitch > 0 && desc.lpSurface)
-        changed = overseer_patch_texture(
-            (uint8_t *)desc.lpSurface, (size_t)desc.lPitch, desc.dwWidth,
-            desc.dwHeight, 1);
-      if (changed)
-        trace_number("Overseer mip pixels corrected: ", changed);
-      IDirectDrawSurface_Unlock(next, desc.lpSurface);
-    }
+    prepare_alpha_surface(next);
     if (current != base)
       IDirectDrawSurface_Release(current);
     current = next;
@@ -197,39 +144,31 @@ static void patch_mips(IDirectDrawSurface *base) {
 
 static HRESULT WINAPI texture_load(IDirect3DTexture2 *target,
                                    IDirect3DTexture2 *source) {
-  char enabled[2];
-  if (GetEnvironmentVariableA("OVERSEER_TRACE_KEYS", enabled,
-                              sizeof(enabled))) {
-    IDirectDrawSurface *surfaces[2] = {find_surface(source),
-                                       find_surface(target)};
-    unsigned i;
-    trace_number("Overseer texture load: ", load_count);
-    for (i = 0; i < 2; ++i) {
-      DDCOLORKEY key;
-      if (surfaces[i] && SUCCEEDED(IDirectDrawSurface_GetColorKey(
-                             surfaces[i], DDCKEY_SRCBLT, &key))) {
-        trace_number(i ? "Overseer target src key low: "
-                       : "Overseer source src key low: ",
-                     key.dwColorSpaceLowValue);
-        trace_number(i ? "Overseer target src key high: "
-                       : "Overseer source src key high: ",
-                     key.dwColorSpaceHighValue);
-      } else {
-        trace_number(i ? "Overseer target no src key: "
-                       : "Overseer source no src key: ", load_count);
-      }
-    }
-  }
-  ++load_count;
-  patch_surface(find_surface(source));
-  patch_mips(find_surface(source));
+  IDirectDrawSurface *surface = find_surface(source);
+  prepare_alpha_surface(surface);
+  prepare_mips(surface);
   return real_texture_load(target, source);
+}
+
+static ULONG WINAPI texture_release(IDirect3DTexture2 *texture) {
+  ULONG references = real_texture_release(texture);
+  unsigned i;
+  if (!references)
+    for (i = 0; i < texture_count; ++i)
+      if (textures[i].texture == texture) {
+        textures[i] = textures[--texture_count];
+        break;
+      }
+  return references;
 }
 
 static void hook_texture(IDirect3DTexture2 *texture) {
   if (texture)
     replace_slot((void **)&texture->lpVtbl->Load, (void *)texture_load,
                  (void **)&real_texture_load);
+  if (texture)
+    replace_slot((void **)&texture->lpVtbl->Release, (void *)texture_release,
+                 (void **)&real_texture_release);
 }
 
 static HRESULT WINAPI surface_qi(IDirectDrawSurface *surface, REFIID iid,
@@ -268,10 +207,68 @@ static HRESULT WINAPI dd2_surface(IDirectDraw2 *dd, DDSURFACEDESC *desc,
 
 static void hook_dd2(IDirectDraw2 *dd);
 
+struct format_callback {
+  LPD3DENUMTEXTUREFORMATSCALLBACK original;
+  void *context;
+  int found;
+};
+
+static int is_a1r5g5b5(const DDSURFACEDESC *desc) {
+  const DDPIXELFORMAT *format = &desc->ddpfPixelFormat;
+  return (format->dwFlags & (DDPF_RGB | DDPF_ALPHAPIXELS)) ==
+             (DDPF_RGB | DDPF_ALPHAPIXELS) &&
+         format->dwRGBBitCount == 16 && format->dwRBitMask == 0x7c00 &&
+         format->dwGBitMask == 0x03e0 && format->dwBBitMask == 0x001f &&
+         format->dwRGBAlphaBitMask == 0x8000;
+}
+
+static HRESULT CALLBACK find_alpha_format(DDSURFACEDESC *desc, void *context) {
+  struct format_callback *callback = context;
+  callback->found |= is_a1r5g5b5(desc);
+  return D3DENUMRET_OK;
+}
+
+static HRESULT CALLBACK forward_alpha_format(DDSURFACEDESC *desc,
+                                             void *context) {
+  struct format_callback *callback = context;
+  if (!is_a1r5g5b5(desc))
+    return D3DENUMRET_OK;
+  return callback->original(desc, callback->context);
+}
+
+static HRESULT WINAPI device2_enum_formats(
+    IDirect3DDevice2 *device, LPD3DENUMTEXTUREFORMATSCALLBACK callback,
+    void *context) {
+  struct format_callback wrapped = {callback, context, 0};
+  HRESULT hr = real_device2_enum_formats(device, find_alpha_format, &wrapped);
+  if (FAILED(hr) || !wrapped.found)
+    return real_device2_enum_formats(device, callback, context);
+  return real_device2_enum_formats(device, forward_alpha_format, &wrapped);
+}
+
+static HRESULT WINAPI d3d2_create_device(IDirect3D2 *d3d, REFCLSID clsid,
+                                         IDirectDrawSurface *surface,
+                                         IDirect3DDevice2 **device) {
+  HRESULT hr = real_d3d2_create_device(d3d, clsid, surface, device);
+  if (SUCCEEDED(hr) && device && *device)
+    replace_slot((void **)&(*device)->lpVtbl->EnumTextureFormats,
+                 (void *)device2_enum_formats,
+                 (void **)&real_device2_enum_formats);
+  return hr;
+}
+
+static void hook_d3d2(IDirect3D2 *d3d) {
+  replace_slot((void **)&d3d->lpVtbl->CreateDevice,
+               (void *)d3d2_create_device,
+               (void **)&real_d3d2_create_device);
+}
+
 static HRESULT WINAPI dd1_qi(IDirectDraw *dd, REFIID iid, void **out) {
   HRESULT hr = real_dd1_qi(dd, iid, out);
   if (SUCCEEDED(hr) && out && *out && same_guid(iid, &dd2_iid))
     hook_dd2((IDirectDraw2 *)*out);
+  if (SUCCEEDED(hr) && out && *out && same_guid(iid, &d3d2_iid))
+    hook_d3d2((IDirect3D2 *)*out);
   return hr;
 }
 
@@ -279,6 +276,8 @@ static HRESULT WINAPI dd2_qi(IDirectDraw2 *dd, REFIID iid, void **out) {
   HRESULT hr = real_dd2_qi(dd, iid, out);
   if (SUCCEEDED(hr) && out && *out && same_guid(iid, &dd2_iid))
     hook_dd2((IDirectDraw2 *)*out);
+  if (SUCCEEDED(hr) && out && *out && same_guid(iid, &d3d2_iid))
+    hook_d3d2((IDirect3D2 *)*out);
   return hr;
 }
 
@@ -346,7 +345,6 @@ HRESULT WINAPI DirectDrawCreate(GUID *guid, IDirectDraw **out,
     real_create = (void *)GetProcAddress(system_ddraw, "DirectDrawCreate");
     if (!real_create)
       return E_FAIL;
-    load_map();
   }
   hr = real_create(guid, out, outer);
   if (SUCCEEDED(hr) && out && *out)

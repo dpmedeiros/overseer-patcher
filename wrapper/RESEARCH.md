@@ -1,8 +1,8 @@
 # Texture color-key investigation
 
-The current wrapper fixes only textures that changed in a comparison with the
-hand-patched office map. The chair still has transparent dark areas, so those
-masks are incomplete.
+The earlier wrapper fixed only textures that changed in a comparison with the
+hand-patched office map. The chair still had transparent dark areas, so those
+masks were incomplete.
 
 `map_lzw.py` reads the original MAP palettes and decodes their 9-to-13-bit
 LSB-first LZW index streams. It does not modify the game. All 10,629 textures
@@ -32,9 +32,12 @@ texture in capture 9 have no source surface key at load time, despite the
 reported visual transparency. A surface key check alone is therefore not yet
 sufficient to decide which black texels should be preserved.
 
-A general fix must preserve the original indexed texels and the intended
-transparency rule until the texture is rendered or converted. The next
-investigation is the game's `D3DRENDERSTATE_COLORKEYENABLE` state and its
-selected texture format. Forcing a working palettized path may preserve the
-index/color distinction; otherwise the wrapper must supply an explicit alpha
-mask derived from the game's material/key state before RGB555 conversion.
+Proton enumerated X1R5G5B5, A1R5G5B5, A4R4G4B4, R5G6B5, X8R8G8B8, and
+A8R8G8B8, with no palettized texture format. Forcing A1R5G5B5 alone left
+every source alpha bit clear: Overseer writes 16-bit RGB values but does not
+populate the alpha bit. The new wrapper chooses A1R5G5B5 and populates that
+bit from the surface's color-key state before each texture load, including
+attached mipmaps. The user reported that the chair, phone, cabinets, and
+curtain all look correct in the office with the original map. This is a
+general rule based on API state rather than room or texture identities, but
+other rooms have not yet been visually checked.

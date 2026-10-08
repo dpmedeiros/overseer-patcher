@@ -1,6 +1,11 @@
 # Tex Murphy: Overseer Steam patcher for Linux
 Historically, Tex Murphy: Overseer is the least playable of the Tex Murphy titles on modern systems. The main issues include FMV codec incompatibilities and texture load problems.
 
+The `ddraw-wrapper` branch also contains a [general texture wrapper](wrapper/README.md)
+that works with the original room maps. The `overseer-patch` script below still
+applies the older office-specific map patch; do not apply that map patch when
+testing the wrapper with clean game data.
+
 `overseer-patch` is an executable Python 3 script that patches the game to fix these issues for Linux systems. Its shell entry point gives a clear error if Python is missing. See [Changes](#changes) for the changes this patcher makes to the game's Wine prefix, game data, and Steam configuration.
 
 **IMPORTANT** Note that the patcher will download and install Proton-CachyOS `cachyos-11.0-20261005-slr` on your system if it does not exist. This version of Proton is needed to provide the codec used by some of the game's FMVs.

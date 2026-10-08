@@ -1,18 +1,24 @@
-# Overseer DirectDraw texture wrapper
+# Overseer DirectDraw alpha wrapper
 
-This wrapper fixes the office phone and cabinet transparency without changing
-`DATA/R01/R01.MAP` on disk. It exports the DirectDraw entry points Overseer
-uses, forwards them to Proton's built-in DirectDraw, and hooks
-`IDirect3DTexture2::Load`. Immediately before that call copies a texture, the
-wrapper corrects the seven full-size office source surfaces and their 14
-attached mipmaps. The remaining black pixels keep the game's color key, so
-the curtain renders as it does with the known palette patch.
+Overseer loads 8-bit indexed textures, but the tested Proton setup offers
+true-color Direct3D texture formats. Overseer normally selects X1R5G5B5,
+where dark palette colors and literal black can both become pixel `0x0000`.
+When the renderer uses black as a color key, visible dark details disappear.
+The old office-specific texture masks fixed the phone and cabinets but missed
+the chair and could not cover other rooms.
 
-The correction masks were derived by capturing the same DirectDraw surfaces
-with the original and palette-patched maps. Each mask is applied only when
-the on-disk map has the tested original hash and the source surface has the
-expected size and pixel hash. An unknown map or surface is left alone. The
-already patched map is recognized and receives no corrections.
+This `ddraw.dll` proxy forwards Overseer's DirectDraw entry points to Proton.
+During `IDirect3DDevice2::EnumTextureFormats`, it selects A1R5G5B5 if that
+format is offered. Before `IDirect3DTexture2::Load`, it fills the alpha bit of
+the source texture and every attached mipmap. All pixels are opaque for a
+surface without a source color key. For a keyed surface, pixels in the key
+range remain transparent. RGB values and game files are unchanged. If
+A1R5G5B5 is unavailable, format enumeration is passed through unchanged.
+
+The fix uses DirectDraw's per-surface color key and has no room or texture
+index list. On the tested installation, the user confirmed that the chair,
+phone, cabinets, and curtain look correct with the original office map.
+Other rooms still need visual playtesting.
 
 ## Build and install
 
@@ -21,27 +27,15 @@ headers and import libraries installed:
 
 ```sh
 ./wrapper/build.sh
-python3 -m unittest -v test_wrapper
+python3 -m unittest -v test_alpha_patch
 ```
 
 With Steam and Overseer closed, copy `wrapper/ddraw.dll` beside
-`OVERSEER.EXE`, restore the tested original `DATA/R01/R01.MAP`, and set the
-game's Steam launch option to include
-`WINEDLLOVERRIDES="ddraw=n,b" %command%`. To uninstall the wrapper, close the
-game, remove that DLL, and remove the override from the launch option. The
-map needs no wrapper-specific restoration because this DLL never writes it.
+`OVERSEER.EXE`, restore the original game map, and set the Steam launch
+option to include `WINEDLLOVERRIDES="ddraw=n,b" %command%`. To uninstall,
+close the game, remove that DLL, and remove the override. The wrapper does
+not write game data.
 
-## Verification
-
-The generated masks reproduce the patched-map captures exactly: 111 base
-surfaces and 218 attached mipmaps were compared, with 783,828 pixels changed
-across 21 surfaces. The unit test uses real captured office textures and
-checks that an altered texture is not matched. In the tested Steam/Proton
-installation, the user confirmed that the phone, cabinets, and curtain look
-correct from different viewing angles with the original map and wrapper.
-
-`generate_masks.py` regenerates `texture_masks.c` from four diagnostic
-captures: original and patched base surfaces, followed by original and patched
-mipmaps. Those full captures are development data and are not needed by the
-installed DLL. The small compressed fixtures used by `test_wrapper.py` are in
-`wrapper/fixtures`.
+`map_lzw.py` and `RESEARCH.md` document the palette analysis. The earlier
+office mask generator, masks, fixtures, and `test_wrapper.py` remain in the
+repository for comparison; they are not linked into this DLL.
