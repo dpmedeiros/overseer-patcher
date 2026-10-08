@@ -1,49 +1,96 @@
-# Tex Murphy: Overseer Steam patcher for Linux
-Historically, Tex Murphy: Overseer is the least playable of the Tex Murphy titles on modern systems. The main issues include FMV codec incompatibilities and texture load problems.
+# Tex Murphy: Overseer patcher for Linux
 
-The `ddraw-wrapper` branch also contains a [general texture wrapper](wrapper/README.md)
-that works with the original room maps. The `overseer-patch` script below still
-applies the older office-specific map patch; do not apply that map patch when
-testing the wrapper with clean game data.
+This installer fixes Overseer's FMV playback and texture transparency issues in the steam installation of Overseer on Linux (App ID `302370`). It bundles a 32-bit DirectDraw wrapper,
+configures Overseer's Wine prefix, and selects a pinned Proton-CachyOS release.
 
-`overseer-patch` is an executable Python 3 script that patches the game to fix these issues for Linux systems. Its shell entry point gives a clear error if Python is missing. See [Changes](#changes) for the changes this patcher makes to the game's Wine prefix, game data, and Steam configuration.
+**Disclosure:** This project was developed primarily by an AI coding agent,
+with human direction and testing.
 
-**IMPORTANT** Note that the patcher will download and install Proton-CachyOS `cachyos-11.0-20261005-slr` on your system if it does not exist. This version of Proton is needed to provide the codec used by some of the game's FMVs.
+## Install
 
-## Use
+**Warning:** If Proton-CachyOS `cachyos-11.0-20261005-slr` is not already
+installed, the patcher will download, verify, and install that release when you
+apply its changes.
 
-To use this patch:
-1. Install Overseer from Steam
-2. Launch it once so that the prefix for the game gets made. If it outright fails to start at all, this patch may fix that by forcing the game to use Proton-CachyOS.
-3. Close Overseer and Steam.
-4. From this directory:
+1. Install Overseer through Steam and launch it once to create its Wine prefix.
+2. Download the `overseer-patcher-<version>-linux.zip` archive from this
+   repository's GitHub Releases page and extract it.
+3. Close Overseer and Steam. Run `./overseer-patch` from the extracted directory.
+   If your ZIP extractor drops executable permissions, run
+   `python3 overseer-patch` instead. The installer shows status, asks to continue,
+   shows its plan, then asks before applying.
+4. Restart Steam. The selected compatibility tool should read
+   `Overseer Proton-CachyOS cachyos-11.0-20261005-slr`.
+
+Use `./overseer-patch revert` with Steam closed to restore the pre-install DLL,
+registry values, and per-game compatibility mapping.
+For a nonstandard Steam root, pass `--steam-root /path/to/Steam`. Python 3.12 or
+newer is required.
+
+## Why the DirectDraw wrapper works
+
+Overseer's textures contain 8-bit pixel indices. Each index selects one of 256
+palette entries; each entry stores three 8-bit color values (red, green, and
+blue) plus an unused fourth byte. That gives each palette color **24 bits of
+RGB**. Overseer converts these colors to the 16-bit X1R5G5B5 texture format,
+which has only **15 bits of RGB**: five bits for each color channel, plus one
+unused bit. Reducing 24 color bits to 15 groups nearby colors together. In a
+captured cabinet texture, palette colors `(1,1,1)` and `(2,2,1)` both became
+`0x0000`, the same RGB value as literal black. Once converted, the RGB value
+alone cannot tell these dark details apart from black background pixels.
+
+A **color key** is a rule attached to a surface: pixels in its keyed RGB range
+should be transparent. **Alpha** records transparency in each pixel. The
+wrapper selects A1R5G5B5 when Proton offers it. This format still has 15 RGB
+bits, but uses the remaining bit for alpha. The wrapper fills that bit for each
+pixel from the source surface's color key, including attached mipmaps: opaque
+black becomes `0x8000`, while transparent keyed black remains `0x0000`. On a
+surface without a color key, every pixel is opaque. This preserves visibility
+despite the RGB quantization; it does not restore the discarded color detail.
+The wrapper works across textures without room or palette-index lists and does
+not change game files. See [wrapper/README.md](wrapper/README.md) for the
+technical details and current limits.
+
+## Changes made by the installer
+
+- Copies the packaged `ddraw.dll` beside `OVERSEER.EXE` and sets the
+  `OVERSEER.EXE` Wine `ddraw` override to `native,builtin` in this game prefix.
+- Sets `VideoMemorySize=128` for `OVERSEER.EXE` in the same prefix, if unset.
+  An existing value other than `128` causes the installer to stop.
+- Adds a per-game Steam `CompatToolMapping` for App ID `302370`, pointing to a
+  unique alias of Proton-CachyOS `cachyos-11.0-20261005-slr`.
+
+Backups and a journal are stored in
+`steamapps/compatdata/302370/overseer-patcher/wrapper`. Revert checks the
+files it owns before restoring them. The wrapper has been
+visually checked in Tex's office, including the chair, phone, cabinets, and
+curtain; other rooms still need playtesting.
+
+## Build and release
+
+On Linux, install Clang, LLD, Wine's Windows development headers, and 32-bit
+Windows import libraries. Then run:
 
 ```sh
-./overseer-patch
+make check
+make dist VERSION=v0.1.0
+(cd dist && sha256sum -c SHA256SUMS)
 ```
-The tool prompts before showing status, showing the plan, and applying the changes. Answer `y` at each prompt to continue. Any other answer, Enter, or Ctrl-C stops before the remaining steps.
 
-Restart Steam after applying so it discovers the game-specific Proton alias. In Steam Properties, the selected compatibility tool should read `Overseer Proton-CachyOS cachyos-11.0-20261005-slr` after restart.
+`make dist` creates a versioned ZIP containing the executable
+`overseer-patch`, compiled `ddraw.dll`, and both READMEs, plus `SHA256SUMS`.
+Pushing a `v*` tag runs the [release workflow](.github/workflows/release.yml),
+which builds, tests, packages, and attaches these files to a GitHub release.
+Run `make clean` to remove generated build and release files.
 
-Run `./overseer-patch revert` with Steam closed to undo the changes this patcher made. Backups and a journal are kept under this game's `steamapps/compatdata/302370/overseer-patcher` directory. The script checks current files before changing or reverting them. Existing texture and registry fixes are recognized and preserved by revert if they predate the patcher.
-
-## WIP
-This patcher remains a work in progress. The tested setup fixes the observed FMV and texture issues in Tex's office; later rooms have not been checked.
-
-Let me know if you still find bugs by filing an issue. I also plan on adding support for the GOG release at some point.
-
-## Changes
-
-- Sets `VideoMemorySize=128` for `OVERSEER.EXE` under this game's prefix `HKCU\Software\Wine\AppDefaults\OVERSEER.EXE\Direct3D` if it is unset. An existing value other than `128` causes a stop.
-- Changes 228 bytes of `DATA/R01/R01.MAP`, limited to palette colors for the office phone and filing cabinets. This avoids color-key transparency while retaining the curtain's own transparency. The original map is backed up before modification.
-- Adds a per-game `CompatToolMapping` for App ID `302370` in the Steam user's `config.vdf`, pointing to the pinned Proton-CachyOS alias. No global mapping is changed.
-
-## Supported signatures
+The installer checks the tested executable signature:
 
 | File | SHA-256 |
 | --- | --- |
-| Original `OVERSEER.EXE` | `5635781f506e953b06df0e28aad2c810bb02d2d64470a158614cbed927e43cfc` |
-| Original `R01.MAP` | `a9a91e1c53ecaada8b709141d626fe946ee6f71c555238397302bc2f244c46ca` |
-| Patched `R01.MAP` | `09b88371443c7beb97d36fa03eec948da59bd500d2667dcb6268c9d51d203766` |
+| `OVERSEER.EXE` | `5635781f506e953b06df0e28aad2c810bb02d2d64470a158614cbed927e43cfc` |
 
-For a nonstandard Steam root, pass `--steam-root /path/to/Steam`. GOG and DVD installations are currently outside this version's scope.
+GOG and DVD installations are outside this release's scope.
+
+## WIP
+This is a work-in-progress. I am still looking for issues that popup and resolving them with
+future revisions of this patcher as I go. Let me know of anything you find by filing an issue.

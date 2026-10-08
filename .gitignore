@@ -4,3 +4,4 @@ wrapper/*.o
 wrapper/*.dll
 wrapper/*.exe
 .wrapper-test-*/
+dist/
