@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+wrapper/*.o
+wrapper/*.dll
+wrapper/*.exe
+.wrapper-test-*/
