@@ -32,6 +32,7 @@ struct texture_surface {
 };
 static struct texture_surface textures[MAX_TEXTURES];
 static unsigned texture_count;
+static unsigned load_count;
 static const GUID texture2_iid = {
     0x93281502,
     0x8cf8,
@@ -196,6 +197,30 @@ static void patch_mips(IDirectDrawSurface *base) {
 
 static HRESULT WINAPI texture_load(IDirect3DTexture2 *target,
                                    IDirect3DTexture2 *source) {
+  char enabled[2];
+  if (GetEnvironmentVariableA("OVERSEER_TRACE_KEYS", enabled,
+                              sizeof(enabled))) {
+    IDirectDrawSurface *surfaces[2] = {find_surface(source),
+                                       find_surface(target)};
+    unsigned i;
+    trace_number("Overseer texture load: ", load_count);
+    for (i = 0; i < 2; ++i) {
+      DDCOLORKEY key;
+      if (surfaces[i] && SUCCEEDED(IDirectDrawSurface_GetColorKey(
+                             surfaces[i], DDCKEY_SRCBLT, &key))) {
+        trace_number(i ? "Overseer target src key low: "
+                       : "Overseer source src key low: ",
+                     key.dwColorSpaceLowValue);
+        trace_number(i ? "Overseer target src key high: "
+                       : "Overseer source src key high: ",
+                     key.dwColorSpaceHighValue);
+      } else {
+        trace_number(i ? "Overseer target no src key: "
+                       : "Overseer source no src key: ", load_count);
+      }
+    }
+  }
+  ++load_count;
   patch_surface(find_surface(source));
   patch_mips(find_surface(source));
   return real_texture_load(target, source);

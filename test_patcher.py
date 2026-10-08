@@ -95,7 +95,8 @@ class PatchFixture(unittest.TestCase):
             shutil.copy2(real_steam / "steamapps/compatdata/302370/pfx/user.reg", prefix / "user.reg")
             real_game = real_steam / "steamapps/common/Overseer"
             shutil.copy2(real_game / "OVERSEER.EXE", game / "OVERSEER.EXE")
-            shutil.copy2(real_game / "DATA/R01/R01.MAP", game / "DATA/R01/R01.MAP")
+            original = (real_game / "DATA/R01/R01.MAP.pre-cabinet-palette.bak").read_bytes()
+            (game / "DATA/R01/R01.MAP").write_bytes(patcher.patch_map(original))
             (tool / "proton").write_text("#!/bin/sh\n")
             (tool / "version").write_text(patcher.RELEASE_TAG)
             (tool / "compatibilitytool.vdf").write_text('"compatibilitytools" { "compat_tools" { "Proton-CachyOS Latest" {} } }')
