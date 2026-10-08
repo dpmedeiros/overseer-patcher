@@ -1,58 +1,20 @@
 #include "texture_patch.h"
+#include "texture_masks.h"
 
 #define ORIGINAL_MAP_FNV UINT64_C(0x9e2d79370a9d945f)
 #define PATCHED_MAP_FNV UINT64_C(0x75aa030863136d04)
 #define MAP_SIZE 4887699u
-
-struct target {
-  unsigned texture;
-  const uint8_t *indices;
-  unsigned count;
-};
-
-static const uint8_t i24[] = {24};
-static const uint8_t i29[] = {29};
-static const uint8_t i33[] = {31, 32, 34, 35, 36, 37, 38};
-static const uint8_t i34[] = {31, 35, 36, 37, 38};
-static const uint8_t i35[] = {31, 36, 37, 38};
-static const uint8_t i37[] = {37};
-static const uint8_t i198[] = {42, 43, 44, 45, 46, 47, 48, 49, 50, 51};
-static const uint8_t i199[] = {44, 48, 49, 51};
-static const uint8_t i201[] = {128, 129, 130, 131};
-static const uint8_t i204[] = {102, 103, 104, 105, 106, 107, 108};
-
-#define TARGET(n, a) {n, a, sizeof(a)}
-static const struct target targets[] = {
-    TARGET(27, i24),   TARGET(28, i24),   TARGET(29, i24),   TARGET(30, i29),
-    TARGET(31, i29),   TARGET(32, i29),   TARGET(33, i33),   TARGET(34, i34),
-    TARGET(35, i35),   TARGET(36, i37),   TARGET(37, i37),   TARGET(38, i37),
-    TARGET(198, i198), TARGET(199, i199), TARGET(200, i199), TARGET(201, i201),
-    TARGET(202, i201), TARGET(203, i201), TARGET(204, i204), TARGET(205, i204),
-    TARGET(206, i204),
-};
-
-static uint32_t le32(const uint8_t *p) {
-  return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 |
-         (uint32_t)p[3] << 24;
-}
-
-static uint16_t le16(const uint8_t *p) {
-  return (uint16_t)p[0] | (uint16_t)p[1] << 8;
-}
-
-static void put16(uint8_t *p, uint16_t value) {
-  p[0] = (uint8_t)value;
-  p[1] = (uint8_t)(value >> 8);
-}
+#define FNV_OFFSET UINT64_C(14695981039346656037)
+#define FNV_PRIME UINT64_C(1099511628211)
 
 int overseer_map_kind(const uint8_t *map, size_t size) {
-  uint64_t hash = UINT64_C(14695981039346656037);
+  uint64_t hash = FNV_OFFSET;
   size_t i;
   if (!map || size != MAP_SIZE)
     return 0;
   for (i = 0; i < size; ++i) {
     hash ^= map[i];
-    hash *= UINT64_C(1099511628211);
+    hash *= FNV_PRIME;
   }
   if (hash == ORIGINAL_MAP_FNV)
     return 1;
@@ -61,105 +23,103 @@ int overseer_map_kind(const uint8_t *map, size_t size) {
   return 0;
 }
 
-static int selected(const struct target *target, uint8_t index) {
-  unsigned i;
-  for (i = 0; i < target->count; ++i)
-    if (target->indices[i] == index)
-      return 1;
-  return 0;
+static uint64_t surface_hash(const uint8_t *surface, size_t pitch,
+                             unsigned width, unsigned height) {
+  uint64_t hash = FNV_OFFSET;
+  unsigned x, y;
+  for (y = 0; y < height; ++y)
+    for (x = 0; x < width * 2u; ++x) {
+      hash ^= surface[y * pitch + x];
+      hash *= FNV_PRIME;
+    }
+  return hash;
 }
 
-static uint16_t rgb555(const uint8_t *palette, uint8_t index, int swap) {
-  const uint8_t *color = palette + 4u * index;
-  unsigned r = color[swap ? 2 : 0] >> 3;
-  unsigned g = color[1] >> 3;
-  unsigned b = color[swap ? 0 : 2] >> 3;
-  return (uint16_t)((r << 10) | (g << 5) | b);
-}
+struct mask_reader {
+  const uint8_t *next;
+  const uint8_t *end;
+  unsigned remaining;
+  unsigned repeat;
+  uint8_t value;
+};
 
-static int texture_layout(const uint8_t *map, size_t map_size, unsigned texture,
-                          unsigned width, unsigned height,
-                          const uint8_t **palette, const uint8_t **pixels) {
-  size_t metadata, entry, pal, pix, count;
-  if (map_size < 16 || le32(map + 8) != 331)
-    return 0;
-  metadata = le32(map + 12);
-  entry = metadata + 36u * texture;
-  if (entry > map_size || map_size - entry < 36 || le32(map + entry) != width ||
-      le32(map + entry + 4) != height || le32(map + entry + 8) != 8)
-    return 0;
-  pal = le32(map + entry + 28);
-  pix = le32(map + entry + 32);
-  count = (size_t)width * height;
-  if (pal > map_size || map_size - pal < 1024 || pix != pal + 1024 ||
-      pix > map_size || map_size - pix < count)
-    return 0;
-  *palette = map + pal;
-  *pixels = map + pix;
-  return 1;
-}
-
-/* Require multiple exact, non-key samples. Sampling ignores source black,
- * because 5:5:5 conversion has already lost distinctions among near-black
- * palette entries. That distinction is recovered from the original map. */
-static int matches(const struct target *target, const uint8_t *palette,
-                   const uint8_t *pixels, const uint8_t *surface, size_t pitch,
-                   unsigned width, unsigned height, int flipped, int swapped) {
-  size_t count = (size_t)width * height;
-  unsigned good = 0, attempt;
-  for (attempt = 0; attempt < 256; ++attempt) {
-    size_t pos = ((size_t)attempt * 131071u + 97u) % count;
-    unsigned x = (unsigned)(pos % width);
-    unsigned y = (unsigned)(pos / width);
-    uint8_t index = pixels[pos];
-    uint16_t expected = rgb555(palette, index, swapped);
-    uint16_t actual;
-    if (!expected || selected(target, index))
-      continue;
-    actual = le16(surface + (flipped ? height - 1u - y : y) * pitch + 2u * x);
-    if ((actual & 0x7fff) != expected)
-      return 0;
-    ++good;
+static int mask_byte(struct mask_reader *reader) {
+  if (!reader->remaining) {
+    uint8_t control;
+    if (reader->next == reader->end)
+      return -1;
+    control = *reader->next++;
+    reader->remaining = (control & 0x7f) + 1u;
+    reader->repeat = control & 0x80;
+    if (reader->repeat) {
+      if (reader->next == reader->end)
+        return -1;
+      reader->value = *reader->next++;
+    }
   }
-  return good >= (count < 1024 ? 8u : 24u);
+  --reader->remaining;
+  if (reader->repeat)
+    return reader->value;
+  if (reader->next == reader->end)
+    return -1;
+  return *reader->next++;
 }
 
-unsigned overseer_patch_texture(const uint8_t *map, size_t map_size,
-                                uint8_t *surface, size_t pitch, unsigned width,
-                                unsigned height) {
-  unsigned t;
-  if (!map || !surface || !width || !height || width > 2048 || height > 2048 ||
+static struct mask_reader reader_for(const struct overseer_mask *mask) {
+  struct mask_reader reader = {mask->rle, mask->rle + mask->rle_size, 0, 0, 0};
+  return reader;
+}
+
+static int valid_mask(const struct overseer_mask *mask) {
+  struct mask_reader reader = reader_for(mask);
+  size_t pixels = (size_t)mask->width * mask->height;
+  size_t at;
+  unsigned changed = 0;
+  for (at = 0; at < (pixels + 7) / 8; ++at) {
+    int value = mask_byte(&reader);
+    unsigned bit;
+    if (value < 0)
+      return 0;
+    for (bit = 0; bit < 8; ++bit) {
+      if ((value & (1 << bit)) && at * 8 + bit >= pixels)
+        return 0;
+      changed += (value >> bit) & 1;
+    }
+  }
+  return reader.next == reader.end && !reader.remaining &&
+         changed == mask->changed_pixels;
+}
+
+unsigned overseer_patch_texture(uint8_t *surface, size_t pitch, unsigned width,
+                                unsigned height, unsigned kind) {
+  size_t i;
+  if (!surface || !width || !height || width > 2048 || height > 2048 ||
       pitch < 2u * width)
     return 0;
-  for (t = 0; t < sizeof(targets) / sizeof(targets[0]); ++t) {
-    const struct target *target = &targets[t];
-    const uint8_t *palette, *pixels;
-    int flipped, swapped;
-    size_t pos, count = (size_t)width * height;
-    unsigned changed = 0;
-    if (!texture_layout(map, map_size, target->texture, width, height, &palette,
-                        &pixels))
+  for (i = 0; i < overseer_mask_count; ++i) {
+    const struct overseer_mask *mask = &overseer_masks[i];
+    struct mask_reader reader;
+    size_t pixels, byte_pos;
+    if (mask->kind != kind || mask->width != width || mask->height != height ||
+        surface_hash(surface, pitch, width, height) != mask->original_hash ||
+        !valid_mask(mask))
       continue;
-    for (flipped = 0; flipped <= 1; ++flipped) {
-      for (swapped = 0; swapped <= 1; ++swapped) {
-        if (!matches(target, palette, pixels, surface, pitch, width, height,
-                     flipped, swapped))
+    reader = reader_for(mask);
+    pixels = (size_t)width * height;
+    for (byte_pos = 0; byte_pos < (pixels + 7) / 8; ++byte_pos) {
+      int value = mask_byte(&reader);
+      unsigned bit;
+      for (bit = 0; bit < 8; ++bit) {
+        size_t pos = byte_pos * 8 + bit;
+        uint8_t *pixel;
+        if (pos >= pixels || !(value & (1 << bit)))
           continue;
-        for (pos = 0; pos < count; ++pos) {
-          unsigned x = (unsigned)(pos % width);
-          unsigned y = (unsigned)(pos / width);
-          uint8_t *dst;
-          if (!selected(target, pixels[pos]))
-            continue;
-          dst = surface + (flipped ? height - 1u - y : y) * pitch + 2u * x;
-          if ((le16(dst) & 0x7fff) == 0) {
-            put16(dst, (uint16_t)((le16(dst) & 0x8000) | 0x0421));
-            ++changed;
-          }
-        }
-        return changed;
+        pixel = surface + (pos / width) * pitch + (pos % width) * 2;
+        pixel[0] = 0x42;
+        pixel[1] = 0x08;
       }
     }
+    return mask->changed_pixels;
   }
   return 0;
 }

@@ -1,6 +1,6 @@
-/* Experimental Overseer-only DirectDraw proxy. Build as 32-bit ddraw.dll.
- * It forwards DirectDrawCreate to Wine's system DLL and edits only recognised
- * office texture source surfaces just before IDirect3DTexture2::Load. */
+/* Overseer-only DirectDraw proxy. Build as 32-bit ddraw.dll. It forwards
+ * Overseer's DirectDraw entry points to Wine and corrects known office source
+ * textures and mipmaps before IDirect3DTexture2::Load. */
 #include "texture_patch.h"
 #include <d3d.h>
 #include <ddraw.h>
@@ -11,12 +11,11 @@
 
 static HMODULE self_module;
 static HMODULE system_ddraw;
-static uint8_t *map_data;
-static size_t map_size;
 static int map_kind;
 static int map_loaded;
 
 static HRESULT(WINAPI *real_create)(GUID *, IDirectDraw **, IUnknown *);
+static HRESULT(WINAPI *real_enumerate_a)(LPDDENUMCALLBACKA, void *);
 static HRESULT(WINAPI *real_dd1_qi)(IDirectDraw *, REFIID, void **);
 static HRESULT(WINAPI *real_dd1_surface)(IDirectDraw *, DDSURFACEDESC *,
                                          IDirectDrawSurface **, IUnknown *);
@@ -85,6 +84,7 @@ static void load_map(void) {
   char path[MAX_PATH];
   DWORD length, size, read_bytes;
   HANDLE file;
+  uint8_t *map_data;
   unsigned i;
   if (map_loaded)
     return;
@@ -106,18 +106,18 @@ static void load_map(void) {
   if (size == MAP_BYTES) {
     map_data = HeapAlloc(GetProcessHeap(), 0, size);
     if (map_data && ReadFile(file, map_data, size, &read_bytes, NULL) &&
-        read_bytes == size) {
-      map_size = size;
-      map_kind = overseer_map_kind(map_data, map_size);
-    }
+        read_bytes == size)
+      map_kind = overseer_map_kind(map_data, size);
+    if (map_data)
+      HeapFree(GetProcessHeap(), 0, map_data);
   }
   CloseHandle(file);
   trace_number("Overseer map kind: ", (unsigned)map_kind);
 }
 
 static void patch_surface(IDirectDrawSurface *surface) {
-  DDPIXELFORMAT format;
-  DDSURFACEDESC desc;
+  DDPIXELFORMAT format = {0};
+  DDSURFACEDESC desc = {0};
   unsigned changed;
   if (!surface || map_kind != 1)
     return;
@@ -130,9 +130,9 @@ static void patch_surface(IDirectDrawSurface *surface) {
   if (FAILED(IDirectDrawSurface_Lock(surface, NULL, &desc, DDLOCK_WAIT, NULL)))
     return;
   if (desc.lPitch > 0 && desc.lpSurface) {
-    changed = overseer_patch_texture(
-        map_data, map_size, (uint8_t *)desc.lpSurface, (size_t)desc.lPitch,
-        desc.dwWidth, desc.dwHeight);
+    changed = overseer_patch_texture((uint8_t *)desc.lpSurface,
+                                     (size_t)desc.lPitch, desc.dwWidth,
+                                     desc.dwHeight, 0);
     if (changed)
       trace_number("Overseer pixels corrected: ", changed);
   }
@@ -163,9 +163,41 @@ static IDirectDrawSurface *find_surface(IDirect3DTexture2 *texture) {
   return NULL;
 }
 
+static void patch_mips(IDirectDrawSurface *base) {
+  IDirectDrawSurface *current = base, *next;
+  DDSCAPS caps = {DDSCAPS_MIPMAP};
+  DDSURFACEDESC desc = {0};
+  unsigned level;
+  if (!base || map_kind != 1)
+    return;
+  for (level = 1; level <= 10; ++level) {
+    next = NULL;
+    if (FAILED(IDirectDrawSurface_GetAttachedSurface(current, &caps, &next)) ||
+        !next || next == current)
+      break;
+    desc.dwSize = sizeof(desc);
+    if (SUCCEEDED(IDirectDrawSurface_Lock(next, NULL, &desc, DDLOCK_WAIT, NULL))) {
+      unsigned changed = 0;
+      if (desc.lPitch > 0 && desc.lpSurface)
+        changed = overseer_patch_texture(
+            (uint8_t *)desc.lpSurface, (size_t)desc.lPitch, desc.dwWidth,
+            desc.dwHeight, 1);
+      if (changed)
+        trace_number("Overseer mip pixels corrected: ", changed);
+      IDirectDrawSurface_Unlock(next, desc.lpSurface);
+    }
+    if (current != base)
+      IDirectDrawSurface_Release(current);
+    current = next;
+  }
+  if (current != base)
+    IDirectDrawSurface_Release(current);
+}
+
 static HRESULT WINAPI texture_load(IDirect3DTexture2 *target,
                                    IDirect3DTexture2 *source) {
   patch_surface(find_surface(source));
+  patch_mips(find_surface(source));
   return real_texture_load(target, source);
 }
 
@@ -246,29 +278,46 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, void *reserved) {
   return TRUE;
 }
 
-HRESULT WINAPI DirectDrawCreate(GUID *guid, IDirectDraw **out,
-                                IUnknown *outer) {
+static int load_system_ddraw(void) {
   char path[MAX_PATH];
   DWORD length;
+  if (system_ddraw)
+    return 1;
+  length = GetSystemDirectoryA(path, MAX_PATH);
+  if (!length || length + sizeof("\\ddraw.dll") >= MAX_PATH)
+    return 0;
+  path[length++] = '\\';
+  path[length++] = 'd';
+  path[length++] = 'd';
+  path[length++] = 'r';
+  path[length++] = 'a';
+  path[length++] = 'w';
+  path[length++] = '.';
+  path[length++] = 'd';
+  path[length++] = 'l';
+  path[length++] = 'l';
+  path[length] = 0;
+  system_ddraw = LoadLibraryA(path);
+  return system_ddraw && system_ddraw != self_module;
+}
+
+HRESULT WINAPI DirectDrawEnumerateA(LPDDENUMCALLBACKA callback, void *context) {
+  if (!load_system_ddraw())
+    return E_FAIL;
+  if (!real_enumerate_a)
+    real_enumerate_a =
+        (void *)GetProcAddress(system_ddraw, "DirectDrawEnumerateA");
+  if (!real_enumerate_a)
+    return E_FAIL;
+  return real_enumerate_a(callback, context);
+}
+
+HRESULT WINAPI DirectDrawCreate(GUID *guid, IDirectDraw **out,
+                                IUnknown *outer) {
   HRESULT hr;
+  if (!load_system_ddraw())
+    return E_FAIL;
   if (!real_create) {
-    length = GetSystemDirectoryA(path, MAX_PATH);
-    if (!length || length + sizeof("\\ddraw.dll") >= MAX_PATH)
-      return E_FAIL;
-    path[length++] = '\\';
-    path[length++] = 'd';
-    path[length++] = 'd';
-    path[length++] = 'r';
-    path[length++] = 'a';
-    path[length++] = 'w';
-    path[length++] = '.';
-    path[length++] = 'd';
-    path[length++] = 'l';
-    path[length++] = 'l';
-    path[length] = 0;
-    system_ddraw = LoadLibraryA(path);
-    if (!system_ddraw || system_ddraw == self_module)
-      return E_FAIL;
     real_create = (void *)GetProcAddress(system_ddraw, "DirectDrawCreate");
     if (!real_create)
       return E_FAIL;

@@ -1,58 +1,47 @@
-# Experimental DirectDraw texture wrapper
+# Overseer DirectDraw texture wrapper
 
-This is an alternative to editing `DATA/R01/R01.MAP`. The Steam game supplies
-X1R5G5B5 textures and a black color key to DirectDraw. Multiple near-black
-palette colors from the original 8-bit map have already collapsed to the same
-16-bit black pixel by that point. Changing the key alone would also remove the
-curtain's intended transparency.
+This wrapper fixes the office phone and cabinet transparency without changing
+`DATA/R01/R01.MAP` on disk. It exports the DirectDraw entry points Overseer
+uses, forwards them to Proton's built-in DirectDraw, and hooks
+`IDirect3DTexture2::Load`. Immediately before that call copies a texture, the
+wrapper corrects the seven full-size office source surfaces and their 14
+attached mipmaps. The remaining black pixels keep the game's color key, so
+the curtain renders as it does with the known palette patch.
 
-The proxy forwards `DirectDrawCreate` to Proton's system `ddraw.dll`. It hooks
-`IDirect3DTexture2::Load`, identifies source surfaces against the tested
-original `R01.MAP`, and changes only pixels corresponding to the 76 palette
-entries in `overseer-patch`. Other black pixels retain the color key. The map
-file on disk is never changed by this wrapper. It does nothing for a map whose
-content does not match the known original, including an already patched map.
+The correction masks were derived by capturing the same DirectDraw surfaces
+with the original and palette-patched maps. Each mask is applied only when
+the on-disk map has the tested original hash and the source surface has the
+expected size and pixel hash. An unknown map or surface is left alone. The
+already patched map is recognized and receives no corrections.
 
-## Build
+## Build and install
 
-On the tested Linux environment, build the 32-bit Windows DLL with:
+On the tested Linux environment, with Clang, LLD, and Wine's 32-bit Windows
+headers and import libraries installed:
 
 ```sh
 ./wrapper/build.sh
 python3 -m unittest -v test_wrapper
 ```
 
-This uses Clang, LLD, and Wine's 32-bit Windows headers and import libraries.
-The result is `wrapper/ddraw.dll`. It must be loaded as a native DLL, for
-example with the game's Steam launch option
-`WINEDLLOVERRIDES="ddraw=n,b" %command%`.
+With Steam and Overseer closed, copy `wrapper/ddraw.dll` beside
+`OVERSEER.EXE`, restore the tested original `DATA/R01/R01.MAP`, and set the
+game's Steam launch option to include
+`WINEDLLOVERRIDES="ddraw=n,b" %command%`. To uninstall the wrapper, close the
+game, remove that DLL, and remove the override from the launch option. The
+map needs no wrapper-specific restoration because this DLL never writes it.
 
-## Verification so far
+## Verification
 
-The isolated matcher test confirms that matching office pixels change and
-other black pixels remain black. A Proton smoke test loaded the DLL as native,
-forwarded to Wine's built-in DirectDraw, and corrected all 452 targeted pixels
-in texture 27 when copying a synthetic source surface. Its source is
-`wrapper/smoke.c`; run `./wrapper/build.sh --smoke` to build it. A full visual
-test in Overseer is still needed before this replaces the map edit in the
-patcher. A live test temporarily installed the original map and wrapper in
-the Steam game, but Overseer did not open a game window. Direct Proton loaded
-the DLL and started `OVERSEER.EXE`, yet did not reach `DirectDrawCreate` during
-the test. The Steam launch also stalled before a game window appeared. The
-patched map, DLL state, and Steam launch option were restored afterward. The
-startup behavior remains unexplained.
+The generated masks reproduce the patched-map captures exactly: 111 base
+surfaces and 218 attached mipmaps were compared, with 783,828 pixels changed
+across 21 surfaces. The unit test uses real captured office textures and
+checks that an altered texture is not matched. In the tested Steam/Proton
+installation, the user confirmed that the phone, cabinets, and curtain look
+correct from different viewing angles with the original map and wrapper.
 
-For a visual test without touching the installed game, create a copy-on-write
-test tree on the same Btrfs filesystem:
-
-```sh
-python3 wrapper/prepare_test.py --game /path/to/Overseer \
-  --original-map /path/to/original/R01.MAP
-```
-
-The helper prints a `.wrapper-test-*` directory in the repository. Launch its
-`OVERSEER.EXE` with the
-tested Proton tool and `WINEDLLOVERRIDES=ddraw=n,b`. A direct Proton launch
-from this test tree loaded the native proxy but did not reach
-`DirectDrawCreate` within 30 seconds. The startup problem needs diagnosis
-before another visual office check.
+`generate_masks.py` regenerates `texture_masks.c` from four diagnostic
+captures: original and patched base surfaces, followed by original and patched
+mipmaps. Those full captures are development data and are not needed by the
+installed DLL. The small compressed fixtures used by `test_wrapper.py` are in
+`wrapper/fixtures`.
