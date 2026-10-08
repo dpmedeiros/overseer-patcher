@@ -1,11 +1,11 @@
 #!/bin/sh
 """:"
 if ! command -v python3 >/dev/null 2>&1; then
-    printf '%s\n' 'Python 3.10 or newer is required to run this source script.' 'Install Python or use a standalone binary release when available.' >&2
+    printf '%s\n' 'Python 3.12 or newer is required to run this script.' >&2
     exit 127
 fi
-if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
-    printf '%s\n' 'Python 3.10 or newer is required to run this source script.' >&2
+if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 12))'; then
+    printf '%s\n' 'Python 3.12 or newer is required to run this script.' >&2
     exit 127
 fi
 exec python3 "$0" "$@"
@@ -13,8 +13,8 @@ exec python3 "$0" "$@"
 DESCRIPTION = """Steam-only Tex Murphy: Overseer compatibility patcher (App ID 302370).
 
 Standard-library-only. Tested asset signatures are deliberately fixed; an
-unknown game build is rejected instead of guessed at. Run with Steam closed
-for apply/revert so Steam does not overwrite its compatibility mapping.
+unknown game build is rejected instead of guessed at. Close Steam before
+installing or reverting so it does not overwrite its compatibility mapping.
 """
 
 import argparse
@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import sys
 import tarfile
 import tempfile
@@ -34,25 +35,11 @@ APPID = "302370"
 RELEASE_TAG = "cachyos-11.0-20261005-slr"
 TOOL_ID = "overseer-cachyos-11.0-20261005"
 ORIGINAL_EXE_SHA = "5635781f506e953b06df0e28aad2c810bb02d2d64470a158614cbed927e43cfc"
-ORIGINAL_MAP_SHA = "a9a91e1c53ecaada8b709141d626fe946ee6f71c555238397302bc2f244c46ca"
-PATCHED_MAP_SHA = "09b88371443c7beb97d36fa03eec948da59bd500d2667dcb6268c9d51d203766"
 REG_SECTION = r"[Software\\Wine\\AppDefaults\\OVERSEER.EXE\\Direct3D]"
 REG_KEY = '"VideoMemorySize"'
-PALETTE_INDICES = {
-    27: (24,), 28: (24,), 29: (24,),
-    30: (29,), 31: (29,), 32: (29,),
-    33: (31, 32, 34, 35, 36, 37, 38),
-    34: (31, 35, 36, 37, 38),
-    35: (31, 36, 37, 38),
-    36: (37,), 37: (37,), 38: (37,),
-    198: (42, 43, 44, 45, 46, 47, 48, 49, 50, 51),
-    199: (44, 48, 49, 51), 200: (44, 48, 49, 51),
-    201: (128, 129, 130, 131), 202: (128, 129, 130, 131),
-    203: (128, 129, 130, 131),
-    204: (102, 103, 104, 105, 106, 107, 108),
-    205: (102, 103, 104, 105, 106, 107, 108),
-    206: (102, 103, 104, 105, 106, 107, 108),
-}
+DLL_SECTION = r"[Software\\Wine\\AppDefaults\\OVERSEER.EXE\\DllOverrides]"
+DLL_KEY = '"ddraw"'
+DLL_OVERRIDE = "native,builtin"
 
 
 class PatchError(Exception):
@@ -65,7 +52,7 @@ class Context:
     library: Path
     game: Path
     prefix: Path
-    map_file: Path
+    dll_file: Path
     registry: Path
     config: Path
     state: Path
@@ -81,6 +68,24 @@ def file_sha(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def wrapper_source() -> Path:
+    root = Path(__file__).resolve().parent
+    for candidate in (root / "ddraw.dll", root / "wrapper/ddraw.dll"):
+        if candidate.is_file():
+            return candidate
+    raise PatchError("ddraw.dll is missing; use the release archive or run 'make' first")
+
+
+def wrapper_bytes() -> bytes:
+    data = wrapper_source().read_bytes()
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        raise PatchError("Bundled ddraw.dll is not a Windows PE binary")
+    pe = struct.unpack_from("<I", data, 0x3C)[0]
+    if pe + 6 > len(data) or data[pe:pe + 4] != b"PE\0\0" or struct.unpack_from("<H", data, pe + 4)[0] != 0x14C:
+        raise PatchError("Bundled ddraw.dll is not a 32-bit x86 DLL")
+    return data
 
 
 def atomic_write(path: Path, data: bytes, *, mode_from: Path | None = None) -> None:
@@ -146,78 +151,51 @@ def discover(explicit_steam: Path | None = None) -> Context:
             if not (prefix / "user.reg").is_file():
                 raise PatchError(f"Steam manifest found, but prefix is missing: {prefix}")
             found.append(Context(steam, library, game, prefix,
-                                 game / "DATA/R01/R01.MAP", prefix / "user.reg",
+                                 game / "ddraw.dll",
+                                 prefix / "user.reg",
                                  steam / "config/config.vdf",
-                                 library / f"steamapps/compatdata/{APPID}/overseer-patcher"))
+                                 library / f"steamapps/compatdata/{APPID}/overseer-patcher/wrapper"))
     unique = {(ctx.game, ctx.prefix): ctx for ctx in found}
     if len(unique) != 1:
         raise PatchError(f"Expected one Steam Overseer installation; found {len(unique)}. Use --steam-root if needed.")
     return next(iter(unique.values()))
 
 
-def patch_map(original: bytes) -> bytes:
-    if sha(original) != ORIGINAL_MAP_SHA:
-        raise PatchError("R01.MAP is not the tested original build")
-    data = bytearray(original)
-    if len(data) != int.from_bytes(data[0:4], "little") or int.from_bytes(data[8:12], "little") != 331:
-        raise PatchError("Unexpected office map structure")
-    metadata = int.from_bytes(data[12:16], "little")
-    changed = 0
-    for texture, indices in PALETTE_INDICES.items():
-        entry = metadata + 36 * texture
-        width = int.from_bytes(data[entry:entry + 4], "little")
-        height = int.from_bytes(data[entry + 4:entry + 8], "little")
-        depth = int.from_bytes(data[entry + 8:entry + 12], "little")
-        palette = int.from_bytes(data[entry + 28:entry + 32], "little")
-        pixels = int.from_bytes(data[entry + 32:entry + 36], "little")
-        if not width or not height or depth != 8 or pixels - palette != 1024:
-            raise PatchError(f"Unexpected texture metadata for entry {texture}")
-        for index in indices:
-            offset = palette + 4 * index
-            color = data[offset:offset + 3]
-            if len(color) != 3 or max(color) >= 8:
-                raise PatchError(f"Unexpected palette value in entry {texture}, index {index}")
-            changed += sum(component != 8 for component in color)
-            data[offset:offset + 3] = b"\x08\x08\x08"
-    if changed != 228 or sha(data) != PATCHED_MAP_SHA:
-        raise PatchError("Computed texture patch failed byte-for-byte verification")
-    return bytes(data)
-
-
-def registry_value(text: str) -> str | None:
+def registry_value(text: str, section: str = REG_SECTION, key: str = REG_KEY) -> str | None:
     lines = text.splitlines()
     start = next((i for i, line in enumerate(lines)
-                  if line == REG_SECTION or line.startswith(REG_SECTION + " ")), None)
+                  if line == section or line.startswith(section + " ")), None)
     if start is None:
         return None
     for line in lines[start + 1:]:
         if line.startswith("["):
             break
-        match = re.fullmatch(r'"VideoMemorySize"="([^"\r\n]*)"', line)
+        match = re.fullmatch(re.escape(key) + r'="([^"\r\n]*)"', line)
         if match:
             return match.group(1)
     return None
 
 
-def edit_registry(text: str, value: str | None) -> str:
+def edit_registry(text: str, value: str | None,
+                  section: str = REG_SECTION, key: str = REG_KEY) -> str:
     newline = "\r\n" if "\r\n" in text else "\n"
     lines = text.splitlines(keepends=True)
     start = next((i for i, line in enumerate(lines)
-                  if line.rstrip("\r\n") == REG_SECTION
-                  or line.rstrip("\r\n").startswith(REG_SECTION + " ")), None)
+                  if line.rstrip("\r\n") == section
+                  or line.rstrip("\r\n").startswith(section + " ")), None)
     if start is None:
         if value is None:
             return text
-        return text.rstrip("\r\n") + newline + newline + REG_SECTION + newline + f'{REG_KEY}="{value}"' + newline
+        return text.rstrip("\r\n") + newline + newline + section + newline + f'{key}="{value}"' + newline
     end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("[")), len(lines))
-    key_line = next((i for i in range(start + 1, end) if lines[i].startswith(REG_KEY + "=")), None)
+    key_line = next((i for i in range(start + 1, end) if lines[i].startswith(key + "=")), None)
     if key_line is not None:
         if value is None:
             del lines[key_line]
         else:
-            lines[key_line] = f'{REG_KEY}="{value}"' + newline
+            lines[key_line] = f'{key}="{value}"' + newline
     elif value is not None:
-        lines.insert(end, f'{REG_KEY}="{value}"' + newline)
+        lines.insert(end, f'{key}="{value}"' + newline)
     return "".join(lines)
 
 
@@ -337,7 +315,7 @@ def proton_candidates(steam: Path):
 def choose_proton(steam: Path) -> Path:
     candidates = list(proton_candidates(steam))
     if not candidates:
-        raise PatchError("Tested Proton-CachyOS release is missing. Run install-proton first.")
+        raise PatchError("Tested Proton-CachyOS release is missing")
     return sorted(candidates, key=lambda p: (
         p.name != "Proton-CachyOS Latest-x86_64_v3",
         p.name != f"Overseer-Proton-CachyOS-{RELEASE_TAG}",
@@ -469,43 +447,43 @@ def save_journal(ctx: Context, data: dict) -> None:
     atomic_write(ctx.state / "journal.json", (json.dumps(data, indent=2) + "\n").encode(), mode_from=ctx.state / "journal.json")
 
 
-def verify_context(ctx: Context) -> tuple[str, str | None, str | None]:
-    if not ctx.map_file.is_file() or not ctx.config.is_file():
-        raise PatchError("Expected game map or Steam config is missing")
+def verify_context(ctx: Context) -> tuple[str | None, str | None, str | None, str | None]:
+    if not ctx.config.is_file():
+        raise PatchError("Steam config is missing")
     if file_sha(ctx.game / "OVERSEER.EXE") != ORIGINAL_EXE_SHA:
         raise PatchError("OVERSEER.EXE differs from the tested original; no change made")
-    map_sha = file_sha(ctx.map_file)
-    if map_sha not in {ORIGINAL_MAP_SHA, PATCHED_MAP_SHA}:
-        raise PatchError("R01.MAP differs from the tested original and patch; no change made")
     reg_text = ctx.registry.read_text(errors="surrogateescape")
     config_text = ctx.config.read_text(errors="surrogateescape")
-    return map_sha, registry_value(reg_text), app_mapping(config_text)[0]
+    dll_sha = file_sha(ctx.dll_file) if ctx.dll_file.is_file() else None
+    return (registry_value(reg_text), app_mapping(config_text)[0],
+            registry_value(reg_text, DLL_SECTION, DLL_KEY), dll_sha)
 
 
 def status(ctx: Context) -> None:
-    map_sha, vram, mapping = verify_context(ctx)
+    vram, mapping, override, dll_sha = verify_context(ctx)
     print(f"Steam root: {ctx.steam}")
     print(f"Game: {ctx.game}")
     print(f"Prefix: {ctx.prefix}")
-    print(f"Textures: {'patched' if map_sha == PATCHED_MAP_SHA else 'original'}")
     print(f"VideoMemorySize: {vram or 'unset'}")
+    print(f"DirectDraw DLL: {dll_sha or 'absent'}")
+    print(f"Overseer DLL override: {override or 'unset'}")
     print(f"Steam per-game Proton: {mapping or 'unset (uses global default)'}")
     try:
         source = choose_proton(ctx.steam)
         print(f"Tested Proton source: {source}")
         ids = [tool_id_from_manifest(p / 'compatibilitytool.vdf') for p in proton_candidates(ctx.steam)]
         if len(ids) != len(set(ids)):
-            print("Note: installed Proton tools share an internal ID; apply creates a unique game-specific alias.")
+            print("Note: installed Proton tools share an internal ID; the installer creates a unique game-specific alias.")
     except PatchError as error:
         print(f"Tested Proton source: missing ({error})")
     journal = read_journal(ctx)
     print(f"Patcher journal: {'present' if journal else 'absent'}")
 
 
-def plan(ctx: Context, include_status: bool = True) -> None:
-    if include_status:
-        status(ctx)
-    print("Apply will set VideoMemorySize=128 only in this prefix and patch 228 office palette bytes as needed.")
+def plan(ctx: Context) -> None:
+    source = wrapper_source()
+    print(f"Apply will install {source} beside OVERSEER.EXE and set its per-app ddraw override.")
+    print("It will set VideoMemorySize=128 only in this prefix.")
     print(f"It will use {RELEASE_TAG}, downloading and verifying the release if absent,")
     print(f"then map App ID {APPID} to a unique alias of that tool.")
     print("Steam and Overseer must be closed. No global compatibility setting is changed.")
@@ -514,21 +492,25 @@ def plan(ctx: Context, include_status: bool = True) -> None:
 def apply(ctx: Context) -> None:
     if steam_running():
         raise PatchError("Close Steam and Overseer before applying; Steam can overwrite config.vdf while running")
-    map_sha, vram, mapping = verify_context(ctx)
+    vram, mapping, override, dll_sha = verify_context(ctx)
     if vram not in {None, "128"}:
         raise PatchError(f"Unexpected existing VideoMemorySize={vram}; no change made")
-    source = install_proton(ctx.steam)
-    alias = alias_path(ctx.steam)
+    dll_data = wrapper_bytes()
+    wanted_dll_sha = sha(dll_data)
     existing = read_journal(ctx)
+    if existing and existing.get("schema") != 2:
+        raise PatchError("Unsupported patcher journal schema")
     if existing and existing.get("state") == "applied":
-        if map_sha == PATCHED_MAP_SHA and vram == "128" and mapping == TOOL_ID:
+        if (existing.get("schema") == 2 and vram == "128" and
+                mapping == TOOL_ID and override == DLL_OVERRIDE and
+                dll_sha == existing.get("installed_dll_sha") == wanted_dll_sha):
             print("Already applied")
             return
         raise PatchError("Journal says applied but configuration differs; inspect status before proceeding")
     if existing:
-        raise PatchError("Incomplete prior journal exists; inspect it before proceeding")
-    original_map = ctx.map_file.read_bytes() if map_sha == ORIGINAL_MAP_SHA else None
-    patched_map = patch_map(original_map) if original_map else None
+        raise PatchError("Existing patcher journal found; run revert before applying this version")
+    source = install_proton(ctx.steam)
+    alias = alias_path(ctx.steam)
     registry_before = ctx.registry.read_bytes()
     config_before = ctx.config.read_bytes()
     reg_text = registry_before.decode("utf-8", "surrogateescape")
@@ -536,39 +518,40 @@ def apply(ctx: Context) -> None:
     old_name, old_span, _ = app_mapping(config_text)
     old_entry = config_text[old_span[0]:old_span[1]] if old_span else None
     ctx.state.mkdir(parents=True, exist_ok=True)
-    if not (ctx.state / "user.reg.before").exists():
-        shutil.copy2(ctx.registry, ctx.state / "user.reg.before")
-    if not (ctx.state / "config.vdf.before").exists():
-        shutil.copy2(ctx.config, ctx.state / "config.vdf.before")
-    if original_map and not (ctx.state / "R01.MAP.before").exists():
-        shutil.copy2(ctx.map_file, ctx.state / "R01.MAP.before")
+    shutil.copy2(ctx.registry, ctx.state / "user.reg.before")
+    shutil.copy2(ctx.config, ctx.state / "config.vdf.before")
+    if dll_sha:
+        shutil.copy2(ctx.dll_file, ctx.state / "ddraw.dll.before")
     journal = {
-        "schema": 1, "state": "prepared", "steam": str(ctx.steam), "game": str(ctx.game),
+        "schema": 2, "state": "prepared", "steam": str(ctx.steam), "game": str(ctx.game),
         "source_proton": str(source.resolve()), "alias": str(alias),
         "alias_created": not alias.exists(),
-        "original_map_sha": map_sha, "original_vram": vram,
+        "original_vram": vram,
+        "original_override": override, "original_dll_sha": dll_sha,
+        "installed_dll_sha": wanted_dll_sha,
         "original_mapping_name": old_name, "original_mapping_entry": old_entry,
         "original_registry_sha": sha(registry_before), "original_config_sha": sha(config_before),
     }
     save_journal(ctx, journal)
     try:
         create_alias(ctx.steam, source)
-        if original_map:
-            atomic_write(ctx.map_file, patched_map, mode_from=ctx.map_file)
-        if vram is None:
-            result = edit_registry(reg_text, "128").encode("utf-8", "surrogateescape")
-            atomic_write(ctx.registry, result, mode_from=ctx.registry)
+        if dll_sha != wanted_dll_sha:
+            atomic_write(ctx.dll_file, dll_data, mode_from=ctx.dll_file)
+        next_reg = edit_registry(reg_text, "128")
+        next_reg = edit_registry(next_reg, DLL_OVERRIDE, DLL_SECTION, DLL_KEY)
+        if next_reg != reg_text:
+            atomic_write(ctx.registry, next_reg.encode("utf-8", "surrogateescape"), mode_from=ctx.registry)
         if mapping != TOOL_ID:
             result = edit_mapping(config_text, TOOL_ID).encode("utf-8", "surrogateescape")
             atomic_write(ctx.config, result, mode_from=ctx.config)
-        if verify_context(ctx) != (PATCHED_MAP_SHA, "128", TOOL_ID):
+        if verify_context(ctx) != ("128", TOOL_ID, DLL_OVERRIDE, wanted_dll_sha):
             raise PatchError("Post-apply verification failed")
         journal["state"] = "applied"
         save_journal(ctx, journal)
     except Exception:
         print("Apply stopped. Run 'revert' to restore changes recorded in the journal.", file=sys.stderr)
         raise
-    print("Applied texture, prefix VRAM, and per-game Proton settings.")
+    print("Installed DirectDraw wrapper, prefix settings, and per-game Proton mapping.")
     print("Restart Steam so it discovers the unique Proton-CachyOS alias.")
     print(f"Backup and journal: {ctx.state}")
 
@@ -579,45 +562,61 @@ def revert(ctx: Context) -> None:
     journal = read_journal(ctx)
     if not journal:
         raise PatchError("No patcher journal found; nothing owned by this patcher to revert")
+    if journal.get("schema") != 2:
+        raise PatchError("Unsupported patcher journal schema")
     if journal.get("game") != str(ctx.game) or journal.get("steam") != str(ctx.steam):
         raise PatchError("Journal refers to a different Steam installation")
-    map_sha, vram, mapping = verify_context(ctx)
-    if map_sha not in {journal["original_map_sha"], PATCHED_MAP_SHA}:
-        raise PatchError("Map changed since apply; refusing to overwrite")
+    vram, mapping, override, dll_sha = verify_context(ctx)
     if vram not in {journal["original_vram"], "128"}:
         raise PatchError("Registry value changed since apply; refusing to overwrite")
+    if override not in {journal["original_override"], DLL_OVERRIDE}:
+        raise PatchError("DirectDraw override changed since apply; refusing to overwrite")
     if mapping not in {journal["original_mapping_name"], TOOL_ID}:
         raise PatchError("Steam compatibility mapping changed since apply; refusing to overwrite")
-    if journal["original_map_sha"] == ORIGINAL_MAP_SHA and map_sha == PATCHED_MAP_SHA:
-        original = (ctx.state / "R01.MAP.before").read_bytes()
-        if sha(original) != ORIGINAL_MAP_SHA:
-            raise PatchError("Map backup failed verification")
-        atomic_write(ctx.map_file, original, mode_from=ctx.map_file)
-    elif map_sha != journal["original_map_sha"]:
-        raise PatchError("Map changed since apply; refusing to overwrite")
-    if journal["original_vram"] is None and vram == "128":
-        original_registry = (ctx.state / "user.reg.before").read_bytes()
-        if sha(original_registry) != journal["original_registry_sha"]:
-            raise PatchError("Registry backup failed verification")
-        expected = edit_registry(original_registry.decode("utf-8", "surrogateescape"), "128").encode("utf-8", "surrogateescape")
-        if file_sha(ctx.registry) == sha(expected):
+    if dll_sha not in {journal["original_dll_sha"], journal["installed_dll_sha"]}:
+        raise PatchError("ddraw.dll changed since apply; refusing to overwrite")
+    original_registry = (ctx.state / "user.reg.before").read_bytes()
+    original_config = (ctx.state / "config.vdf.before").read_bytes()
+    if sha(original_registry) != journal["original_registry_sha"]:
+        raise PatchError("Registry backup failed verification")
+    if sha(original_config) != journal["original_config_sha"]:
+        raise PatchError("Steam config backup failed verification")
+    if journal["original_dll_sha"] is not None:
+        original_dll = (ctx.state / "ddraw.dll.before").read_bytes()
+        if sha(original_dll) != journal["original_dll_sha"]:
+            raise PatchError("DirectDraw DLL backup failed verification")
+    else:
+        original_dll = None
+    original_reg_text = original_registry.decode("utf-8", "surrogateescape")
+    expected_reg = edit_registry(original_reg_text, "128")
+    expected_reg = edit_registry(expected_reg, DLL_OVERRIDE, DLL_SECTION, DLL_KEY)
+    if (vram != journal["original_vram"] or override != journal["original_override"]):
+        current_reg = ctx.registry.read_bytes()
+        if current_reg == expected_reg.encode("utf-8", "surrogateescape"):
             atomic_write(ctx.registry, original_registry, mode_from=ctx.registry)
         else:
-            reg_text = ctx.registry.read_text(errors="surrogateescape")
-            atomic_write(ctx.registry, edit_registry(reg_text, None).encode("utf-8", "surrogateescape"), mode_from=ctx.registry)
-    elif vram != journal["original_vram"]:
-        raise PatchError("Registry value changed since apply; refusing to overwrite")
+            reg_text = current_reg.decode("utf-8", "surrogateescape")
+            reg_text = edit_registry(reg_text, journal["original_vram"])
+            reg_text = edit_registry(reg_text, journal["original_override"], DLL_SECTION, DLL_KEY)
+            atomic_write(ctx.registry, reg_text.encode("utf-8", "surrogateescape"), mode_from=ctx.registry)
     if mapping == TOOL_ID and journal["original_mapping_name"] != TOOL_ID:
-        config_text = ctx.config.read_text(errors="surrogateescape")
+        config_text = ctx.config.read_bytes()
         original_entry = journal["original_mapping_entry"]
-        restored = edit_mapping(config_text, None, restore_raw=original_entry) if original_entry else edit_mapping(config_text, None)
-        atomic_write(ctx.config, restored.encode("utf-8", "surrogateescape"), mode_from=ctx.config)
-    elif mapping != journal["original_mapping_name"]:
-        raise PatchError("Steam compatibility mapping changed since apply; refusing to overwrite")
+        if config_text == edit_mapping(original_config.decode("utf-8", "surrogateescape"), TOOL_ID).encode("utf-8", "surrogateescape"):
+            atomic_write(ctx.config, original_config, mode_from=ctx.config)
+        else:
+            text = config_text.decode("utf-8", "surrogateescape")
+            restored = edit_mapping(text, None, restore_raw=original_entry) if original_entry else edit_mapping(text, None)
+            atomic_write(ctx.config, restored.encode("utf-8", "surrogateescape"), mode_from=ctx.config)
+    if dll_sha != journal["original_dll_sha"]:
+        if original_dll is None:
+            ctx.dll_file.unlink()
+        else:
+            atomic_write(ctx.dll_file, original_dll, mode_from=ctx.dll_file)
     if journal["alias_created"]:
         remove_alias(Path(journal["alias"]), Path(journal["source_proton"]))
     (ctx.state / "journal.json").unlink()
-    print("Restored the pre-patcher map, registry value, and Steam per-game mapping.")
+    print("Restored the pre-patcher DirectDraw DLL, prefix settings, and Steam per-game mapping.")
     print("Restart Steam to reload compatibility tools.")
 
 
@@ -632,36 +631,24 @@ def confirm_step(description: str) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=DESCRIPTION)
-    parser.add_argument("command", nargs="?", choices=["status", "plan", "apply", "revert", "install-proton"],
-                        help="omit for the guided status → plan → apply workflow")
+    parser.add_argument("command", nargs="?", choices=["revert"],
+                        help="omit to review status and plan before applying; use revert to undo this installer")
     parser.add_argument("--steam-root", type=Path, help="Steam root when autodetection is ambiguous")
     args = parser.parse_args()
     try:
         ctx = discover(args.steam_root)
-        if args.command is None:
-            for description, action in (
-                ("Show installation status?", lambda: status(ctx)),
-                ("Show proposed changes?", lambda: plan(ctx, include_status=False)),
-                ("Apply these changes? Close Steam and Overseer first.", lambda: apply(ctx)),
-            ):
-                if not confirm_step(description):
-                    print("Stopped without running the remaining steps.")
-                    break
-                action()
-        elif args.command == "status":
-            status(ctx)
-        elif args.command == "plan":
-            plan(ctx)
-        elif args.command == "apply":
-            apply(ctx)
-        elif args.command == "revert":
+        if args.command == "revert":
             revert(ctx)
         else:
-            if steam_running():
-                raise PatchError("Close Steam before installing a compatibility tool")
-            source = install_proton(ctx.steam)
-            print(f"Tested release available: {source}")
-            print("Restart Steam before selecting a newly downloaded tool.")
+            status(ctx)
+            if not confirm_step("Continue to proposed changes?"):
+                print("Stopped without making changes.")
+                return 0
+            plan(ctx)
+            if not confirm_step("Apply these changes? Close Steam and Overseer first."):
+                print("Stopped without making changes.")
+                return 0
+            apply(ctx)
         return 0
     except (PatchError, OSError, ValueError, KeyError) as error:
         print(f"Error: {error}", file=sys.stderr)
